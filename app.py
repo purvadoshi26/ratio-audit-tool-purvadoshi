@@ -136,8 +136,12 @@ with st.sidebar:
     auto_mat = st.checkbox("Auto-detect threshold", value=True)
     if not auto_mat:
         mat_pct = st.slider("Variance threshold (%)", 5, 50, 20, 5)
+        abs_override = st.number_input(
+            "Absolute threshold (in file units, 0 = auto)", min_value=0.0, value=0.0,
+            help="Auto = 0.5% of CY revenue. Enter your performance materiality here to override.")
     else:
         mat_pct = 20
+        abs_override = 0.0
 
     st.markdown("---")
     st.markdown("""
@@ -229,9 +233,11 @@ with tab_main:
                 st.stop()
 
         unit_label = unit_info["label"]
-        threshold_abs = unit_info["threshold"] if auto_mat else None
+        threshold_abs = abs_override if abs_override else unit_info["threshold"]
 
-        st.success(f"✅ {len(df)} accounts loaded · Units: **{unit_label}** · Materiality: **{unit_info['threshold']:,.2f}**")
+        st.success(f"✅ {len(df)} accounts loaded · Units: **{unit_label}** · "
+                   f"Variance threshold: **{threshold_abs:,.2f}** "
+                   f"({'manual' if abs_override else unit_info['basis']})")
 
         # Show warnings
         for w in tb_warnings:
@@ -245,7 +251,8 @@ with tab_main:
                 st.caption("Add a Category column to your file or rename account names to match common keywords.")
 
         with st.spinner("Running analysis..."):
-            results = run_analysis(df, unit_info, mat_pct, standard)
+            results = run_analysis(df, unit_info, mat_pct, standard,
+                                   abs_threshold=abs_override or None)
 
         agg    = results["agg"]
         ratios = results["ratios"]
@@ -467,7 +474,7 @@ with tab_bf:
         - Payment vouchers ledger
         - GL transaction listing
 
-        Minimum 20 rows. Best with 500+.
+        Minimum 50 rows (ideally 100+). Best with 500+.
         """)
 
     if bf_file is not None:
