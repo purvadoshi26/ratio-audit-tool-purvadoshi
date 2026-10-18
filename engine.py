@@ -119,31 +119,86 @@ KEYWORD_RULES = [
 ]
 
 
-def _classify(name: str) -> str:
-    n = name.lower().strip()
-    n = re.sub(r'[^a-z0-9 /&\-()]', ' ', n)
-    n = re.sub(r'\s+', ' ', n).strip()
+def _norm_name(name: str) -> str:
+    n = str(name).lower().strip()
+    n = re.sub(r'[-/]', ' ', n)
+    n = re.sub(r'[^a-z0-9 &()]', ' ', n)
+    return re.sub(r'\s+', ' ', n).strip()
 
-    scores = {}
+
+def _kw_re(kw: str):
+    """Whole-word match (optional plural s/es) so 'car' != 'carriage', 'rent' != 'current'."""
+    if kw.endswith('y') and len(kw) > 3:      # salary -> salaries, liability -> liabilities
+        body = re.escape(kw[:-1]) + r'(?:y|ies)'
+    else:
+        body = re.escape(kw) + r'(?:s|es)?'
+    return re.compile(r'(?<![a-z0-9])' + body + r'(?![a-z0-9])')
+
+
+_KW_CACHE = {}
+def _has_kw(n: str, kw: str) -> bool:
+    rx = _KW_CACHE.get(kw)
+    if rx is None:
+        rx = _KW_CACHE[kw] = _kw_re(kw)
+    return rx.search(n) is not None
+
+
+def _has_any(name: str, kws) -> bool:
+    n = _norm_name(name)
+    return any(_has_kw(n, k) for k in kws)
+
+
+def _classify(name: str) -> str:
+    n = _norm_name(name)
+    hits = []   # (keyword, category, weight)
     for keywords, category, weight in KEYWORD_RULES:
         for kw in keywords:
-            if kw in n:
-                scores[category] = scores.get(category, 0) + weight
-
+            if _has_kw(n, kw):
+                hits.append((kw, category, weight))
+    # longest match wins: drop a keyword that is only part of a longer matched keyword
+    # (e.g. 'sales' inside 'cost of sales', 'cash' inside 'cash credit')
+    kws = {h[0] for h in hits}
+    hits = [h for h in hits if not any(h[0] != o and _has_kw(o, h[0]) for o in kws)]
+    scores = {}
+    for _, category, weight in hits:
+        scores[category] = scores.get(category, 0) + weight
     if not scores:
         return "unclassified"
     return max(scores, key=scores.get)
 
 
 def _is_subtotal(name: str) -> bool:
-    n = name.lower().strip()
-    for kw in SUBTOTAL_KEYWORDS:
-        if kw in n:
-            return True
-    # Also skip rows that are ONLY numbers or dashes
-    if re.match(r'^[\d\s\-\.,]+$', n):
+    n = _norm_name(name)
+    if any(_has_kw(n, kw) for kw in SUBTOTAL_KEYWORDS):
         return True
-    return False
+    # rows that are ONLY numbers or dashes
+    return bool(re.match(r'^[\d\s\-\.,]+$', str(name).lower().strip()))
+
+
+INVENTORY_KEYWORDS = ["inventory", "stock in trade", "stock", "raw material", "wip",
+                      "work in progress", "finished good", "closing stock"]
+
+DEBTOR_KEYWORDS = ["debtor", "receivable", "trade receivable", "sundry debtor", "book debt", "bills receivable"]
+CREDITOR_KEYWORDS = ["creditor", "payable", "trade payable", "sundry creditor", "supplier payable", "bills payable"]
+BORROWING_KEYWORDS = ["term loan", "long term loan", "long term borrowing", "secured loan", "unsecured loan",
+                      "debenture", "bond", "ncd", "bank od", "overdraft", "cash credit", "working capital loan",
+                      "short term loan", "short term borrowing", "mortgage"]
+
+
+def _is_inventory(name: str) -> bool:
+    return _has_any(name, INVENTORY_KEYWORDS)
+
+
+def _is_debtor(name: str) -> bool:
+    return _has_any(name, DEBTOR_KEYWORDS)
+
+
+def _is_creditor(name: str) -> bool:
+    return _has_any(name, CREDITOR_KEYWORDS)
+
+
+def _is_borrowing(name: str) -> bool:
+    return _has_any(name, BORROWING_KEYWORDS)
 
 
 def _clean_amount(val) -> float:
@@ -243,8 +298,8 @@ def load_tb(filepath: str):
     df.columns = [str(c).strip() for c in df.columns]
 
     name_col = _find_col(df, ["account name", "account", "particulars", "description", "head", "ledger"])
-    cy_col   = _find_col(df, ["cy amount", "cy", "current year", "2025", "2024", "2023", "fy 25", "fy 24"])
-    py_col   = _find_col(df, ["py amount", "py", "prior year", "previous year", "2024", "2023", "2022", "fy 24", "fy 23"])
+    cy_col   = _find_col(df, ["cy amount", "cy", "current year", "2026", "2025", "2024", "2023", "fy 26", "fy 25", "fy 24"])
+    py_col   = _find_col(df, ["py amount", "py", "prior year", "previous year", "2025", "2024", "2023", "2022", "fy 25", "fy 24", "fy 23"])
     cat_col  = _find_col(df, ["category", "type", "classification", "group", "head of account"])
 
     # cy and py might be same col if only 2 number cols — disambiguate
@@ -295,22 +350,28 @@ def load_tb(filepath: str):
         axis=1
     )
 
-    # Unit detection
+    # Unit detection: only rescale plain-rupee files. Anything smaller is taken
+    # "as provided" (we cannot know if it is already in lakhs / crores).
     max_val = df[["CY Amount", "PY Amount"]].abs().max().max()
-    if max_val >= 1_00_00_000:   # >= 1 crore
-        label, threshold = "₹ Crores", 2.0
-        df["CY Amount"] = df["CY Amount"] / 1_00_00_000
-        df["PY Amount"] = df["PY Amount"] / 1_00_00_000
-    elif max_val >= 1_00_000:    # >= 1 lakh
-        label, threshold = "₹ Lakhs", 5.0
-        df["CY Amount"] = df["CY Amount"] / 1_00_000
-        df["PY Amount"] = df["PY Amount"] / 1_00_000
-    elif max_val >= 1:
-        label, threshold = "₹ Crores", 0.5
+    if max_val >= 1_00_00_000:   # >= 1 crore in plain rupees
+        label, div = "₹ Crores", 1_00_00_000
+    elif max_val >= 1_00_000:    # >= 1 lakh in plain rupees
+        label, div = "₹ Lakhs", 1_00_000
     else:
-        label, threshold = "₹", 50000.0
+        label, div = "₹ (as provided in file)", 1
+    if div != 1:
+        df["CY Amount"] = df["CY Amount"] / div
+        df["PY Amount"] = df["PY Amount"] / div
 
-    unit_info = {"label": label, "threshold": threshold, "max_val": max_val}
+    # Variance threshold: 0.5% of CY revenue (≈ performance materiality). If there is no
+    # revenue, fall back to 1% of the largest balance. User can override in the app.
+    rev_cy = df.loc[df["Category"] == "revenue", "CY Amount"].sum()
+    if rev_cy > 0:
+        threshold, basis = 0.005 * rev_cy, "0.5% of CY revenue"
+    else:
+        threshold = 0.01 * df[["CY Amount", "PY Amount"]].abs().max().max()
+        basis = "1% of largest balance (no revenue found)"
+    unit_info = {"label": label, "threshold": threshold, "basis": basis, "max_val": max_val}
 
     errors, warnings = validate_df(df)
     if errors:
@@ -336,6 +397,18 @@ def aggregate(df):
     ltl   = s("long_term_liabilities")
     eq    = s("equity")
 
+    inv_df = df[(df["Category"] == "current_assets") & df["Account Name"].apply(_is_inventory)]
+    inv  = {"cy": inv_df["CY Amount"].sum(), "py": inv_df["PY Amount"].sum()}
+
+    debtors_df = df[(df["Category"] == "current_assets") & df["Account Name"].apply(_is_debtor)]
+    debtors = {"cy": debtors_df["CY Amount"].sum(), "py": debtors_df["PY Amount"].sum()}
+
+    creditors_df = df[(df["Category"] == "current_liabilities") & df["Account Name"].apply(_is_creditor)]
+    creditors = {"cy": creditors_df["CY Amount"].sum(), "py": creditors_df["PY Amount"].sum()}
+
+    borrowings_df = df[(df["Category"].isin(["current_liabilities", "long_term_liabilities"])) & df["Account Name"].apply(_is_borrowing)]
+    borrowings = {"cy": borrowings_df["CY Amount"].sum(), "py": borrowings_df["PY Amount"].sum()}
+
     gp   = {"cy": rev["cy"] - cogs["cy"],          "py": rev["py"] - cogs["py"]}
     op   = {"cy": gp["cy"]  - exp["cy"],            "py": gp["py"]  - exp["py"]}
     np_  = {"cy": op["cy"]  - int_e["cy"],          "py": op["py"]  - int_e["py"]}
@@ -348,7 +421,8 @@ def aggregate(df):
         "gross_profit": gp, "operating_profit": op, "net_profit": np_,
         "current_assets": ca, "fixed_assets": fa,
         "current_liabilities": cl, "long_term_liabilities": ltl,
-        "equity": eq, "total_assets": ta, "total_liabilities": tl, "working_capital": wc,
+        "equity": eq, "inventory": inv, "debtors": debtors, "creditors": creditors, "borrowings": borrowings,
+        "total_assets": ta, "total_liabilities": tl, "working_capital": wc,
     }
 
 
@@ -400,6 +474,10 @@ def calculate_ratios(agg, standard):
     fa_cy  = r["fixed_assets"]["cy"];     fa_py  = r["fixed_assets"]["py"]
     cogs_cy= r["cogs"]["cy"];             cogs_py= r["cogs"]["py"]
     wc_cy  = r["working_capital"]["cy"];  wc_py  = r["working_capital"]["py"]
+    inv_cy = r["inventory"]["cy"];        inv_py = r["inventory"]["py"]
+    debtors_cy = r.get("debtors", {}).get("cy", 0); debtors_py = r.get("debtors", {}).get("py", 0)
+    creditors_cy = r.get("creditors", {}).get("cy", 0); creditors_py = r.get("creditors", {}).get("py", 0)
+    borrowings_cy = r.get("borrowings", {}).get("cy", 0); borrowings_py = r.get("borrowings", {}).get("py", 0)
 
     has_rev = rev_cy != 0
     has_bs  = ta_cy  != 0
@@ -415,7 +493,7 @@ def calculate_ratios(agg, standard):
             ref["ap"], "Profitability"),
 
         _make_ratio("Net Profit Margin (%)",
-            "Net Profit / Revenue × 100",
+            "Net Profit (pre-tax, as per TB) / Revenue × 100",
             _safe_div(np_cy, rev_cy, 100) if has_rev else None,
             _safe_div(np_py, rev_py, 100),
             [("<", 0, "🔴 HIGH"), ("yoy>", 20, "🟡 MODERATE")],
@@ -433,7 +511,7 @@ def calculate_ratios(agg, standard):
         _make_ratio("Revenue Growth (%)",
             "(CY − PY) / PY × 100",
             _yoy(rev_cy, rev_py) if has_rev and rev_py != 0 else None, None,
-            [("yoy>", 25, "🟡 MODERATE"), ("yoy<", -20, "🔴 HIGH")],
+            [("<", -20, "🔴 HIGH"), ("<", -10, "🟡 MODERATE"), (">", 25, "🟡 MODERATE")],
             f"Significant change → verify cut-off, returns, credit notes. Ref: {ref['revenue']}.",
             ref["ap"], "Profitability"),
 
@@ -470,11 +548,12 @@ def calculate_ratios(agg, standard):
             ref["gc"], "Liquidity"),
 
         _make_ratio("Quick Ratio",
-            "(Current Assets − Inventory est.) / Current Liabilities",
-            _safe_div(ca_cy - cogs_cy * 0.15, cl_cy) if has_cl else None,
-            _safe_div(ca_py - cogs_py * 0.15, cl_py),
+            "(Current Assets − Inventory) / Current Liabilities",
+            _safe_div(ca_cy - inv_cy, cl_cy) if has_cl else None,
+            _safe_div(ca_py - inv_py, cl_py),
             [("<", 0.8, "🔴 HIGH"), ("<", 1.0, "🟡 MODERATE")],
-            "Low quick ratio → liquidity depends on inventory. Verify stock realisability.",
+            "Inventory = accounts classified as stock/WIP/raw material/finished goods. "
+            "If none were found, quick ratio equals current ratio. Low value → liquidity depends on inventory.",
             ref["gc"], "Liquidity"),
 
         _make_ratio("Working Capital / Revenue",
@@ -486,7 +565,7 @@ def calculate_ratios(agg, standard):
             ref["gc"], "Liquidity"),
 
         _make_ratio("Debt-to-Equity",
-            "Total Liabilities / Equity",
+            "Total Liabilities / Equity (includes trade payables, not borrowings only)",
             _safe_div(tl_cy, eq_cy) if eq_cy != 0 else None,
             _safe_div(tl_py, eq_py),
             [(">", 3.0, "🔴 HIGH"), (">", 2.0, "🟡 MODERATE")],
@@ -509,6 +588,14 @@ def calculate_ratios(agg, standard):
             "High ratio → solvency concern. Verify asset valuations and debt completeness.",
             ref["ap"], "Leverage"),
 
+        _make_ratio("Debt-Equity Ratio (Borrowings only)",
+            "Total Borrowings / Equity",
+            _safe_div(borrowings_cy, eq_cy) if eq_cy != 0 and borrowings_cy > 0 else None,
+            _safe_div(borrowings_py, eq_py) if eq_py != 0 and borrowings_py > 0 else None,
+            [(">", 2.0, "🔴 HIGH"), (">", 1.5, "🟡 MODERATE")],
+            f"Schedule III standard: borrowings only. High ratio indicates financial risk. Ref: {ref['gc']}.",
+            ref["gc"], "Leverage"),
+
         _make_ratio("Asset Turnover",
             "Revenue / Total Assets",
             _safe_div(rev_cy, ta_cy) if has_bs else None,
@@ -524,6 +611,62 @@ def calculate_ratios(agg, standard):
             [("yoy>", 20, "🟡 MODERATE")],
             f"Large change → verify capex, disposals, and depreciation policy. Ref: {ref['impairment']}.",
             ref["ap"], "Efficiency"),
+
+        _make_ratio("Trade Receivables Turnover",
+            "Revenue / Trade Receivables",
+            _safe_div(rev_cy, debtors_cy) if debtors_cy > 0 and has_rev else None,
+            _safe_div(rev_py, debtors_py) if debtors_py > 0 and rev_py != 0 else None,
+            [("<", 2.0, "🟡 MODERATE"), ("yoy>", 25, "🟡 MODERATE")],
+            f"Schedule III mandatory ratio. Falling turnover indicates collection delays or disputed balances. Ref: {ref['ap']}.",
+            ref["ap"], "Efficiency"),
+
+        _make_ratio("Trade Receivables Days (DSO)",
+            "365 / Trade Receivables Turnover",
+            _safe_div(365 * debtors_cy, rev_cy) if debtors_cy > 0 and has_rev else None,
+            _safe_div(365 * debtors_py, rev_py) if debtors_py > 0 and rev_py != 0 else None,
+            [(">", 120, "🟡 MODERATE"), ("yoy>", 25, "🟡 MODERATE")],
+            "Average days to collect receivables. Check debtor ageing and ECL provisioning under Ind AS 109.",
+            ref["ap"], "Efficiency"),
+
+        _make_ratio("Trade Payables Turnover",
+            "COGS / Trade Payables",
+            _safe_div(cogs_cy, creditors_cy) if creditors_cy > 0 and cogs_cy != 0 else None,
+            _safe_div(cogs_py, creditors_py) if creditors_py > 0 and cogs_py != 0 else None,
+            [("yoy>", 25, "🟡 MODERATE")],
+            f"Schedule III mandatory ratio. Falling turnover indicates supplier payment delays. Ref: {ref['ap']}.",
+            ref["ap"], "Efficiency"),
+
+        _make_ratio("Trade Payables Days (DPO)",
+            "365 / Trade Payables Turnover",
+            _safe_div(365 * creditors_cy, cogs_cy) if creditors_cy > 0 and cogs_cy != 0 else None,
+            _safe_div(365 * creditors_py, cogs_py) if creditors_py > 0 and cogs_py != 0 else None,
+            [(">", 120, "🟡 MODERATE"), ("yoy>", 25, "🟡 MODERATE")],
+            "Average days to pay vendors. Check MSME interest liability under MSMED Act 2006 for payments > 45 days.",
+            ref["ap"], "Efficiency"),
+
+        _make_ratio("Inventory Turnover",
+            "COGS / Inventory",
+            _safe_div(cogs_cy, inv_cy) if inv_cy > 0 and cogs_cy != 0 else None,
+            _safe_div(cogs_py, inv_py) if inv_py > 0 and cogs_py != 0 else None,
+            [("<", 2.0, "🟡 MODERATE"), ("yoy>", 25, "🟡 MODERATE")],
+            f"Schedule III mandatory ratio. Low turnover suggests slow-moving/obsolete inventory. Ref: {ref['ap']}.",
+            ref["ap"], "Efficiency"),
+
+        _make_ratio("Inventory Holding Days (DIO)",
+            "365 / Inventory Turnover",
+            _safe_div(365 * inv_cy, cogs_cy) if inv_cy > 0 and cogs_cy != 0 else None,
+            _safe_div(365 * inv_py, cogs_py) if inv_py > 0 and cogs_py != 0 else None,
+            [(">", 180, "🔴 HIGH"), ("yoy>", 25, "🟡 MODERATE")],
+            "Average days inventory is held. Long holding period flags obsolescence risk (Ind AS 2 NRV review).",
+            ref["ap"], "Efficiency"),
+
+        _make_ratio("Net Capital Turnover Ratio",
+            "Revenue / Working Capital",
+            _safe_div(rev_cy, wc_cy) if wc_cy > 0 and has_rev else None,
+            _safe_div(rev_py, wc_py) if wc_py > 0 and rev_py != 0 else None,
+            [("<", 0, "🔴 HIGH"), ("yoy>", 30, "🟡 MODERATE")],
+            f"Schedule III mandatory ratio. Steep change indicates working capital funding strain. Ref: {ref['ap']}.",
+            ref["ap"], "Efficiency"),
     ]
     return ratios
 
@@ -536,49 +679,53 @@ def _auto_commentary(name, category, cy, py, change_pct, flag, agg):
     name_l = name.lower()
 
     if "🔴" not in flag and "🟡" not in flag:
-        return "Movement within materiality threshold. No further procedures required at this stage."
+        return "Below the variance threshold. No explanation required under the analytical-procedures threshold; consider other risk factors separately."
 
-    abs_pct = abs(change_pct) if change_pct != 999.0 else None
+    is_new = (change_pct == 999.0)
+    if is_new:
+        return ("New account with no prior year balance. Confirm nature, obtain supporting "
+                "documentation, and verify appropriateness of classification.")
+    abs_pct = abs(change_pct)
     direction = "increased" if cy > py else "decreased"
 
-    # Specific account commentary
-    if any(k in name_l for k in ["debtor", "receivable", "trade receivable"]):
-        if cy > py and abs_pct and abs_pct > rev_growth + 10:
+    def has(*kws): return _has_any(name, kws)
+
+    # Specific commentary is gated on the category so e.g. 'Cost of sales' or 'Bank charges'
+    # do not receive revenue / cash commentary.
+    if category == "current_assets" and has("debtor", "receivable", "trade receivable"):
+        if cy > py and abs_pct > rev_growth + 10:
             return f"Trade receivables {direction} by {abs_pct:.1f}%, which exceeds revenue growth of {rev_growth:.1f}%. This inconsistency may indicate collection issues, fictitious debtors, or premature revenue recognition. Obtain debtor ageing schedule and review post-balance sheet collections."
         return f"Trade receivables {direction} by {abs_pct:.1f}%. Verify recoverability by obtaining debtor ageing and reviewing post-balance sheet receipts."
 
-    if any(k in name_l for k in ["inventor", "stock"]):
+    if category == "current_assets" and _is_inventory(name):
         return f"Inventory {direction} by {abs_pct:.1f}%. Verify physical stock count, cost vs NRV valuation, and slow-moving/obsolete items."
 
-    if any(k in name_l for k in ["creditor", "payable", "trade payable"]):
+    if category == "current_liabilities" and has("creditor", "payable", "trade payable"):
         return f"Trade payables {direction} by {abs_pct:.1f}%. Confirm completeness of liabilities and check for unrecorded payables at year-end."
 
-    if any(k in name_l for k in ["cash", "bank"]):
+    if category == "current_assets" and has("cash", "bank"):
         return f"Cash & Bank {direction} by {abs_pct:.1f}%. Agree to bank reconciliation statements and review large unexplained movements."
 
-    if any(k in name_l for k in ["loan", "borrowing", "term loan"]):
+    if category in ("long_term_liabilities", "current_liabilities") and has("loan", "borrowing", "term loan"):
         return f"Loan balance {direction} by {abs_pct:.1f}%. Agree to loan sanction letter, confirm outstanding balance with lender, and verify interest accruals."
 
-    if any(k in name_l for k in ["revenue", "sales", "turnover"]):
+    if category == "revenue" and has("revenue", "sales", "turnover"):
         return f"Revenue {direction} by {abs_pct:.1f}%. Perform cut-off testing around year-end and verify revenue recognition policy compliance."
 
-    if any(k in name_l for k in ["salary", "wage", "employee", "staff"]):
+    if category == "expenses" and has("salary", "wage", "employee", "staff"):
         return f"Staff costs {direction} by {abs_pct:.1f}%. Agree to payroll records and HR headcount. Verify any new joinees or leavers."
 
-    if any(k in name_l for k in ["reserve", "surplus", "retained"]):
+    if category == "equity" and has("reserve", "surplus", "retained"):
         return f"Equity reserve {direction} by {abs_pct:.1f}%. Agree to profit appropriation and board resolution. Verify dividend declarations if any."
 
-    if any(k in name_l for k in ["depreciation", "amortis"]):
+    if category == "expenses" and has("depreciation", "amortisation", "amortization"):
         return f"Depreciation {direction} by {abs_pct:.1f}%. Agree to fixed asset register and verify rate consistency with prior year."
 
-    if any(k in name_l for k in ["advance", "prepaid"]):
+    if category == "current_assets" and has("advance", "prepaid"):
         return f"Advance/Prepaid {direction} by {abs_pct:.1f}%. Verify nature, recoverability, and whether any should be expensed in the current period."
 
-    if any(k in name_l for k in ["other income", "misc income"]):
+    if category == "revenue" and has("other income", "misc income"):
         return f"Other income {direction} by {abs_pct:.1f}%. Enquire about nature and verify occurrence. Assess whether correctly classified vs revenue."
-
-    if change_pct == 999.0:
-        return f"New account with no prior year balance. Confirm nature, obtain supporting documentation, and verify appropriateness of classification."
 
     # Generic
     cat_map = {
@@ -597,9 +744,9 @@ def _auto_commentary(name, category, cy, py, change_pct, flag, agg):
 
 
 # ── VARIANCE WITH MATERIALITY & COMMENTARY ───────────────────
-def calculate_variance(df, mat_pct, unit_info, agg):
-    threshold_abs = unit_info["threshold"]
-    overall_mat = agg["revenue"]["cy"] * 0.05 if agg["revenue"]["cy"] else threshold_abs * 10
+def calculate_variance(df, mat_pct, unit_info, agg, abs_threshold=None):
+    """abs_threshold (in file units) overrides the data-driven default in unit_info."""
+    threshold_abs = abs_threshold if abs_threshold else unit_info["threshold"]
 
     rows = []
     for _, row in df.iterrows():
@@ -670,7 +817,7 @@ def going_concern(agg, ratios, standard):
     np_py = agg["net_profit"]["py"]
     if np_cy is not None and np_cy < 0:
         indicators.append(ind("Net loss in current year", "🔴 CONCERN",
-            f"Net loss of {np_cy:,.2f}. Entity is loss-making.", f"{ref['gc']} para A2(a)",
+            f"Net loss of {np_cy:,.2f}. Entity is loss-making.", f"{ref['gc']} (events/conditions)",
             "Obtain management's explanation. Review future projections."))
         score += 2
         if np_py is not None and np_py < 0:
@@ -678,82 +825,82 @@ def going_concern(agg, ratios, standard):
     else:
         indicators.append(ind("Net loss in current year", "🟢 CLEAR",
             f"Entity is profitable. Net profit: {np_cy:,.2f}." if np_cy else "Profit data not available.",
-            f"{ref['gc']} para A2(a)"))
+            f"{ref['gc']} (events/conditions)"))
 
     cr = ratio_map.get("Current Ratio")
     if cr and cr["CY"] is not None:
         if cr["CY"] < 1.0:
             indicators.append(ind("Current Ratio < 1", "🔴 CONCERN",
-                f"CR = {cr['CY']:.2f}. Entity cannot meet short-term obligations.", f"{ref['gc']} para A2(b)",
+                f"CR = {cr['CY']:.2f}. Entity cannot meet short-term obligations.", f"{ref['gc']} (events/conditions)",
                 "Obtain cash flow projections and evidence of committed facilities.")); score += 2
         elif cr["CY"] < 1.5:
             indicators.append(ind("Current Ratio < 1.5", "🟡 MONITOR",
-                f"CR = {cr['CY']:.2f}. Tight liquidity — monitor closely.", f"{ref['gc']} para A2(b)")); score += 1
+                f"CR = {cr['CY']:.2f}. Tight liquidity — monitor closely.", f"{ref['gc']} (events/conditions)")); score += 1
         else:
             indicators.append(ind("Current Ratio", "🟢 CLEAR",
-                f"CR = {cr['CY']:.2f}. Adequate liquidity.", f"{ref['gc']} para A2(b)"))
+                f"CR = {cr['CY']:.2f}. Adequate liquidity.", f"{ref['gc']} (events/conditions)"))
     else:
-        indicators.append(ind("Current Ratio", "⚪ N/A", "Insufficient data.", f"{ref['gc']} para A2(b)"))
+        indicators.append(ind("Current Ratio", "⚪ N/A", "Insufficient data.", f"{ref['gc']} (events/conditions)"))
 
     wc_cy = agg["working_capital"]["cy"]
     if wc_cy is not None and wc_cy < 0:
         indicators.append(ind("Negative working capital", "🔴 CONCERN",
-            f"WC = {wc_cy:,.2f}. Negative.", f"{ref['gc']} para A2(b)",
+            f"WC = {wc_cy:,.2f}. Negative.", f"{ref['gc']} (events/conditions)",
             "Review debt maturity profile and refinancing plans.")); score += 2
     else:
         indicators.append(ind("Negative working capital", "🟢 CLEAR",
-            f"WC = {wc_cy:,.2f}. Positive." if wc_cy is not None else "N/A.", f"{ref['gc']} para A2(b)"))
+            f"WC = {wc_cy:,.2f}. Positive." if wc_cy is not None else "N/A.", f"{ref['gc']} (events/conditions)"))
 
     ic = ratio_map.get("Interest Coverage")
     if ic and ic["CY"] is not None:
         if ic["CY"] < 1.0:
             indicators.append(ind("Interest coverage < 1", "🔴 CONCERN",
-                f"Coverage = {ic['CY']:.2f}. Cannot cover interest from operations.", f"{ref['gc']} para A2(c)",
+                f"Coverage = {ic['CY']:.2f}. Cannot cover interest from operations.", f"{ref['gc']} (events/conditions)",
                 "Review loan covenant compliance and risk of default.")); score += 2
         elif ic["CY"] < 2.0:
             indicators.append(ind("Interest coverage < 2", "🟡 MONITOR",
-                f"Coverage = {ic['CY']:.2f}. Vulnerable to earnings decline.", f"{ref['gc']} para A2(c)")); score += 1
+                f"Coverage = {ic['CY']:.2f}. Vulnerable to earnings decline.", f"{ref['gc']} (events/conditions)")); score += 1
         else:
             indicators.append(ind("Interest coverage", "🟢 CLEAR",
-                f"Coverage = {ic['CY']:.2f}. Adequate.", f"{ref['gc']} para A2(c)"))
+                f"Coverage = {ic['CY']:.2f}. Adequate.", f"{ref['gc']} (events/conditions)"))
     else:
-        indicators.append(ind("Interest coverage", "⚪ N/A", "No interest data.", f"{ref['gc']} para A2(c)"))
+        indicators.append(ind("Interest coverage", "⚪ N/A", "No interest data.", f"{ref['gc']} (events/conditions)"))
 
     de = ratio_map.get("Debt-to-Equity")
     if de and de["CY"] is not None:
         if de["CY"] > 3.0:
             indicators.append(ind("Excessive leverage (D/E > 3)", "🔴 CONCERN",
-                f"D/E = {de['CY']:.2f}. High debt burden.", f"{ref['gc']} para A2(d)",
+                f"D/E = {de['CY']:.2f}. High debt burden.", f"{ref['gc']} (events/conditions)",
                 "Verify covenant compliance and assess risk of lender withdrawal.")); score += 1
         else:
             indicators.append(ind("Excessive leverage", "🟢 CLEAR",
-                f"D/E = {de['CY']:.2f}.", f"{ref['gc']} para A2(d)"))
+                f"D/E = {de['CY']:.2f}.", f"{ref['gc']} (events/conditions)"))
     else:
-        indicators.append(ind("Excessive leverage", "⚪ N/A", "Insufficient data.", f"{ref['gc']} para A2(d)"))
+        indicators.append(ind("Excessive leverage", "⚪ N/A", "Insufficient data.", f"{ref['gc']} (events/conditions)"))
 
     rev_gr = ratio_map.get("Revenue Growth (%)")
     if rev_gr and rev_gr["CY"] is not None:
         if rev_gr["CY"] < -20:
             indicators.append(ind("Significant revenue decline > 20%", "🔴 CONCERN",
-                f"Revenue fell {rev_gr['CY']:.1f}%.", f"{ref['gc']} para A2(a)",
+                f"Revenue fell {rev_gr['CY']:.1f}%.", f"{ref['gc']} (events/conditions)",
                 "Investigate customer loss, market contraction, pricing issues.")); score += 1
         elif rev_gr["CY"] < -10:
             indicators.append(ind("Revenue decline 10–20%", "🟡 MONITOR",
-                f"Revenue fell {rev_gr['CY']:.1f}%.", f"{ref['gc']} para A2(a)")); score += 0
+                f"Revenue fell {rev_gr['CY']:.1f}%.", f"{ref['gc']} (events/conditions)")); score += 0
         else:
             indicators.append(ind("Significant revenue decline", "🟢 CLEAR",
-                f"Revenue growth = {rev_gr['CY']:.1f}%.", f"{ref['gc']} para A2(a)"))
+                f"Revenue growth = {rev_gr['CY']:.1f}%.", f"{ref['gc']} (events/conditions)"))
     else:
-        indicators.append(ind("Revenue trend", "⚪ N/A", "Insufficient data.", f"{ref['gc']} para A2(a)"))
+        indicators.append(ind("Revenue trend", "⚪ N/A", "Insufficient data.", f"{ref['gc']} (events/conditions)"))
 
     if score == 0:
-        risk, conclusion = "LOW", f"No significant going concern indicators. Document basis of preparation under {ref['gc']} para 9. No material uncertainty disclosure required at this stage."
+        risk, conclusion = "LOW", f"No significant going concern indicators from these ratios. Document the going-concern assessment under {ref['gc']}."
     elif score <= 2:
-        risk, conclusion = "MODERATE", f"Some indicators present. Under {ref['gc']} para 12–15, obtain management's written going concern assessment and supporting cash flow projections for 12 months."
+        risk, conclusion = "MODERATE", f"Some indicators present. Under {ref['gc']}, obtain management's going concern assessment and supporting cash flow projections."
     elif score <= 5:
-        risk, conclusion = "HIGH", f"Multiple indicators identified. Perform extended procedures under {ref['gc']} para 16–17. Consider whether a material uncertainty disclosure is required in the financial statements."
+        risk, conclusion = "HIGH", f"Multiple indicators identified. Perform additional procedures under {ref['gc']} and consider whether a material uncertainty disclosure is required."
     else:
-        risk, conclusion = "CRITICAL", f"Serious doubt about the entity's ability to continue as a going concern. Consider modified opinion under {ref['gc']} para 21–24. Escalate to engagement partner immediately."
+        risk, conclusion = "CRITICAL", f"Many indicators present. Escalate to the engagement partner; the audit opinion implications under {ref['gc']} are a matter of professional judgement, not of this score."
 
     return {"overall_risk": risk, "score": score, "conclusion": conclusion, "indicators": indicators}
 
@@ -802,12 +949,14 @@ def risk_summary(df_var, ratios, gc, bf):
 
 
 # ── MAIN ENTRY POINT ──────────────────────────────────────────
-def run_analysis(df, unit_info, mat_pct, standard):
+def run_analysis(df, unit_info, mat_pct, standard, abs_threshold=None):
     agg_data = aggregate(df)
     ratios   = calculate_ratios(agg_data, standard)
-    df_var   = calculate_variance(df, mat_pct, unit_info, agg_data)
+    df_var   = calculate_variance(df, mat_pct, unit_info, agg_data, abs_threshold)
     gc       = going_concern(agg_data, ratios, standard)
-    return {"agg": agg_data, "ratios": ratios, "variance": df_var, "going_concern": gc}
+    used     = abs_threshold if abs_threshold else unit_info["threshold"]
+    return {"agg": agg_data, "ratios": ratios, "variance": df_var, "going_concern": gc,
+            "threshold_used": used}
 
 
 # ── BENFORD'S LAW ─────────────────────────────────────────────
@@ -815,9 +964,9 @@ def run_benford(amounts, label="Transactions"):
     amounts = [a for a in amounts if isinstance(a, (int, float)) and a > 0]
     n = len(amounts)
 
-    if n < 20:
+    if n < 50:
         return {"sufficient": False,
-                "message": f"Only {n} valid amounts. Need at least 20 for meaningful analysis.",
+                "message": f"Only {n} valid amounts. Need at least 50 (ideally 100+) for a meaningful chi-square test.",
                 "risk_flag": "⚪ Insufficient Data"}
 
     counts = {d: 0 for d in range(1, 10)}
@@ -858,6 +1007,8 @@ def run_benford(amounts, label="Transactions"):
         flag = "🟢 LOW — Consistent with Benford's Law"
         interp = f"χ² = {chi_sq:.2f}. Distribution consistent with Benford's Law. No significant fraud indicator from first-digit analysis."
 
+    if n < 100:
+        interp += f" Caution: n = {n} is small; chi-square is unreliable below ~100 items."
     return {"sufficient": True, "n": n, "label": label,
             "chi_square": round(chi_sq, 2), "digit_data": digit_data,
             "risk_flag": flag, "interpretation": interp}
