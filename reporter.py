@@ -417,7 +417,7 @@ def generate_report(df_variance, ratios, agg, gc, bf,
         ("METHODOLOGY", [
             ("Variance — HIGH", "Change ≥ 1.5× threshold % AND above absolute threshold"),
             ("Variance — MODERATE", "Change ≥ threshold % AND above absolute threshold"),
-            ("Materiality threshold", "Auto-scaled: ₹ Crores → 2.0  |  ₹ Lakhs → 5.0"),
+            ("Materiality threshold", "Auto: 0.5% of CY revenue (or 1% of largest balance if no revenue)  |  user override in sidebar"),
             ("Going Concern Score", "0 = LOW  |  1–2 = MODERATE  |  3–5 = HIGH  |  6+ = CRITICAL"),
             ("Benford's Law", "χ² test df=8  |  p<0.05 → notable  |  p<0.01 → significant deviation"),
             ("Risk Score per account", "HIGH flag = +3  |  MODERATE flag = +1"),
